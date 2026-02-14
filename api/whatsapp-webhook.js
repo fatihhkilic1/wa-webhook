@@ -306,15 +306,21 @@ export default async function handler(req, res) {
 
       console.log("FROM:", from, "STATE:", session.state, "TEXT:", t, "PAYLOAD:", inbound.payloadId);
 
-      // ---------- HUMAN MODE ----------
-      // Bot susar. Sadece menü komutu ile menü gösterilebilir (istersen kaldır).
-      if (session.state === "HUMAN") {
-        const intent = detectIntent(t);
-        if (intent === "menu") {
-          setSession(from, "MAIN_MENU");
-          await showMainMenu(from);
-        }
-        return res.status(200).send("EVENT_RECEIVED");
+// ---------- HUMAN MODE (LOCKED) ----------
+if (session.state === "HUMAN") {
+
+  // Sadece kullanıcı bilinçli olarak menü isterse çık
+  if (containsAny(t, ["menu", "menü", "ana menu", "ana menü"])) {
+    setSession(from, "MAIN_MENU");
+    await showMainMenu(from);
+    return res.status(200).send("EVENT_RECEIVED");
+  }
+
+  // Aksi halde bot tamamen susar
+  console.log("HUMAN MODE ACTIVE - BOT SILENT");
+  return res.status(200).send("EVENT_RECEIVED");
+}
+
       }
 
       // ---------- Payload Router (Interactive) ----------
