@@ -1,31 +1,24 @@
 // /api/whatsapp-webhook.js
-// Production-ready v1: Intent Config + State Machine + Smart Escalation (HUMAN handoff)
-// NOTE: Memory store (Set/Map) serverless restart'ta sıfırlanabilir. DB'ye sonra taşıyacağız.
+// ===============================
+// Madmext WhatsApp Support Engine v3 (Production)
+// - Intent scoring + typo/abbr tolerance
+// - State machine (order/cargo/return/support)
+// - Interactive UI (List + Buttons)
+// - Smart escalation to human when user can't find info
+// - Ticket creation (in-memory demo; DB ready)
+// - Operator notification webhook (optional)
+// ===============================
 
-const seen = new Set();
-const userState = new Map(); // phone -> { state, data, updatedAt }
-const tickets = new Map();   // ticketNo -> ticket object (demo)
+const seen = new Set();         // dedup (serverless restart -> resets)
+const sessions = new Map();     // from -> { state, data, updatedAt }
+const tickets = new Map();      // ticketNo -> ticket (demo, DB ready)
 
-function pickInboundText(body) {
-  const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-  if (!msg) return null;
+// ---------- Helpers ----------
+function nowTs() { return Date.now(); }
 
-  const from = msg.from;
-  const id = msg.id;
-
-  const text =
-    msg.type === "text" ? msg.text?.body :
-    msg.type === "button" ? msg.button?.text :
-    msg.type === "interactive"
-      ? (msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title)
-      : "";
-
-  return { from, id, text: (text || "").trim(), raw: msg };
-}
-
-// --- TR normalize (typo-friendly baseline) ---
-function normalize(s) {
-  return (s || "")
+function normalize(raw) {
+  // TR-friendly, typo baseline
+  return (raw || "")
     .toLowerCase()
     .replace(/[“”"']/g, "")
     .replace(/[ç]/g, "c")
@@ -39,61 +32,97 @@ function normalize(s) {
     .trim();
 }
 
+function compact(s) { return (s || "").replace(/\s/g, ""); }
+
 function containsAny(text, arr) {
   for (const k of arr) if (text.includes(k)) return true;
   return false;
 }
 
-function genTicketNo(prefix = "MX") {
+function getSession(from) {
+  return sessions.get(from) || { state: "NEW", data: {}, updatedAt: nowTs() };
+}
+function setSession(from, state, patch = {}) {
+  const cur = getSession(from);
+  sessions.set(from, {
+    state,
+    data: { ...(cur.data || {}), ...patch },
+    updatedAt: nowTs(),
+  });
+}
+
+function genTicket(prefix = "MX") {
   const n = Math.floor(10000 + Math.random() * 90000);
   return `${prefix}-${n}`;
 }
 
-function getMainMenu() {
-  return (
-    "Madmext WhatsApp Destek\n\n" +
-    "Size nasıl yardımcı olalım?\n" +
-    "1) Sipariş durumu\n" +
-    "2) Kargo takibi\n" +
-    "3) İade / Değişim\n" +
-    "4) Şikayet / Destek\n\n" +
-    "İsterseniz direkt yazarak da anlatabilirsiniz. (örn: 'iade istiyorum')"
-  );
+function isCannotFind(t) {
+  // user can't find order no / info
+  return containsAny(t, [
+    "bulamadim", "bulamiyorum", "bulamiyorum", "bulamiyorum",
+    "bulamadım", "bulamıyorum",
+    "yok", "bilmiyorum", "hatirlamiyorum", "hatırlamiyorum", "hatirlamiyorum",
+    "siparis no yok", "siparis numaram yok", "siparis numarasi yok",
+    "bulunmuyor", "bulamadim ya", "bulamiyorum ya",
+  ]);
 }
 
-function orderNoHelpText() {
-  return (
-    "Sipariş numaranızı şöyle bulabilirsiniz:\n\n" +
-    "• Madmext.com: Hesabım → Siparişlerim → ilgili sipariş → Sipariş No\n" +
-    "• Mobil Uygulama: Hesabım → Siparişlerim → ilgili sipariş → Sipariş No\n" +
-    "• Pazaryeri: Uygulama → Siparişlerim → ilgili sipariş → Sipariş/Sipariş Kodu\n\n" +
-    "Bulamazsanız 'bulamadım' yazın, canlı desteğe aktaralım."
-  );
+function isLiveSupportIntent(t) {
+  return containsAny(t, [
+    "canli destek", "canli", "temsilci", "musteri hizmetleri", "insanla konus",
+    "canli baglan", "canliya bagla", "operatore baglan", "canliya aktar",
+  ]);
 }
 
-async function sendTextMessage({ to, text }) {
-  const token = process.env.WA_ACCESS_TOKEN;
-  const phoneNumberId = process.env.WA_PHONE_NUMBER_ID;
+// ---------- WhatsApp Message Extraction ----------
+function extractInbound(body) {
+  const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+  if (!msg) return null;
 
-  if (!token || !phoneNumberId) {
-    console.log("⚠️ Missing WA_ACCESS_TOKEN or WA_PHONE_NUMBER_ID");
-    return { ok: false, error: "missing_env" };
+  const from = msg.from;
+  const id = msg.id;
+
+  let text = "";
+  let payloadId = null;
+  let payloadTitle = null;
+
+  if (msg.type === "text") {
+    text = msg.text?.body || "";
+  } else if (msg.type === "interactive") {
+    if (msg.interactive?.button_reply) {
+      payloadId = msg.interactive.button_reply.id;
+      payloadTitle = msg.interactive.button_reply.title;
+      text = payloadTitle || "";
+    } else if (msg.interactive?.list_reply) {
+      payloadId = msg.interactive.list_reply.id;
+      payloadTitle = msg.interactive.list_reply.title;
+      text = payloadTitle || "";
+    }
+  } else if (msg.type === "button") {
+    // legacy button messages
+    text = msg.button?.text || "";
   }
 
-  const url = `https://graph.facebook.com/v19.0/${phoneNumberId}/messages`;
+  return { from, id, text: (text || "").trim(), payloadId, payloadTitle, raw: msg };
+}
 
-  const resp = await fetch(url, {
+// ---------- WhatsApp Sender ----------
+async function waSend(payload) {
+  const token = process.env.WA_ACCESS_TOKEN;
+  const phoneId = process.env.WA_PHONE_NUMBER_ID;
+
+  if (!token || !phoneId) {
+    console.log("⚠️ Missing WA_ACCESS_TOKEN or WA_PHONE_NUMBER_ID");
+    return { ok: false };
+  }
+
+  const resp = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
-    }),
+    body: JSON.stringify(payload),
   });
 
   const data = await resp.json().catch(() => ({}));
@@ -101,13 +130,52 @@ async function sendTextMessage({ to, text }) {
   return { ok: resp.ok, status: resp.status, data };
 }
 
-// Operatöre bildirim (Telegram/Slack/Panel webhook). İstersen kapat.
+async function sendText(to, text) {
+  return waSend({
+    messaging_product: "whatsapp",
+    to,
+    type: "text",
+    text: { body: text },
+  });
+}
+
+// Buttons max 3
+async function sendButtons(to, bodyText, buttons) {
+  return waSend({
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: bodyText },
+      action: {
+        buttons: buttons.slice(0, 3).map((b) => ({
+          type: "reply",
+          reply: { id: b.id, title: b.title },
+        })),
+      },
+    },
+  });
+}
+
+// List for 4+ options
+async function sendList(to, bodyText, buttonText, sections) {
+  return waSend({
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      body: { text: bodyText },
+      action: { button: buttonText, sections },
+    },
+  });
+}
+
+// ---------- Operator Notify (optional) ----------
 async function notifyOperator(payload) {
-  const url = process.env.OPERATOR_WEBHOOK_URL; // örn: Telegram bot webhook / Slack webhook / kendi panel endpoint'in
-  if (!url) {
-    console.log("OPERATOR_WEBHOOK_URL not set; skipping notify.");
-    return;
-  }
+  const url = process.env.OPERATOR_WEBHOOK_URL; // optional
+  if (!url) return;
   try {
     await fetch(url, {
       method: "POST",
@@ -119,86 +187,96 @@ async function notifyOperator(payload) {
   }
 }
 
-// ---------------- INTENT ENGINE (config-based) ----------------
+// ---------- UX blocks ----------
+function orderNoHelpText() {
+  return (
+    "Sipariş numaranızı şöyle bulabilirsiniz:\n\n" +
+    "• Madmext.com: Hesabım → Siparişlerim → ilgili sipariş → Sipariş No\n" +
+    "• Mobil Uygulama: Hesabım → Siparişlerim → ilgili sipariş → Sipariş No\n" +
+    "• Pazaryeri: Uygulama → Siparişlerim → ilgili sipariş → Sipariş/Sipariş Kodu\n\n" +
+    "Bulamazsanız 'bulamadım' yazın, canlı desteğe aktaralım."
+  );
+}
+
+function returnFlowIntroText() {
+  return "İade / Değişim için siparişinizi nereden oluşturdunuz?";
+}
+
+async function showMainMenu(from) {
+  // List menu (best UX + 4 seçenek)
+  return sendList(
+    from,
+    "Size nasıl yardımcı olabilirim?",
+    "Menüyü Aç",
+    [
+      {
+        title: "Madmext Destek",
+        rows: [
+          { id: "m_order", title: "Sipariş Durumu" },
+          { id: "m_cargo", title: "Kargo Takibi" },
+          { id: "m_return", title: "İade / Değişim" },
+          { id: "m_support", title: "Şikayet / Destek" },
+        ],
+      },
+    ]
+  );
+}
+
+// ---------- Abbreviations / typo tolerance ----------
+const ABBR = new Map([
+  ["mrb", "merhaba"],
+  ["mrhb", "merhaba"],
+  ["slm", "selam"],
+  ["sa", "selam"],
+  ["s.a", "selam"],
+  ["s a", "selam"],
+  ["ii", "iyi"],
+]);
+
+function expandAbbr(t) {
+  // token-based: replace common abbreviations
+  const parts = (t || "").split(" ");
+  const out = parts.map((p) => ABBR.get(p) || p);
+  return out.join(" ");
+}
+
+// ---------- Intent Scoring Engine (config) ----------
 const INTENTS = [
-  {
-    name: "menu",
-    keywords: ["menu", "menü", "ana menu", "ana menü", "anamenu", "basla", "başla", "start", "yardim", "yardım", "help"],
-    score: 5,
-  },
-  {
-    name: "greeting",
-    keywords: ["merhaba", "mrb", "mrhb", "selam", "slm", "selamlar", "sa", "s a", "gunaydin", "günaydın", "iyi gunler", "iyi günler", "iyi aksamlar", "iyi akşamlar", "hello", "hi"],
-    score: 3,
-  },
-  {
-    name: "human",
-    keywords: ["canli destek", "canlı destek", "temsilci", "insan", "musteri hizmetleri", "müşteri hizmetleri", "canli baglan", "canlıya baglan", "canliya bagla"],
-    score: 5,
-  },
-  {
-    name: "return",
-    keywords: ["iade", "degisim", "değişim", "geri gonder", "geri gönder", "geri yolla", "degistir", "değiştir", "beden kucuk", "beden küçük", "beden buyuk", "beden büyük", "kusurlu", "defolu", "hasarli", "hasarlı"],
-    score: 4,
-  },
-  {
-    name: "cargo",
-    keywords: ["kargo", "kargo takip", "takip no", "takip numarasi", "kargom", "kargo nerede", "kargo geldi mi"],
-    score: 3,
-  },
-  {
-    name: "order",
-    keywords: ["siparis", "sipariş", "siparisim", "siparişim", "siparis durumu", "sipariş durumu", "nerede", "hazirlaniyor", "hazırlanıyor", "iptal", "adres degis", "adres değiş"],
-    score: 3,
-  },
-  {
-    name: "complaint",
-    keywords: ["sikayet", "şikayet", "magdur", "mağdur", "problem", "sorun", "destek", "yardim edin", "yardım edin"],
-    score: 2,
-  },
+  { name: "menu", weight: 6, keywords: ["menu", "menü", "ana menu", "ana menü", "anamenu", "basla", "başla", "start", "yardim", "yardım", "help"] },
+  { name: "greet", weight: 3, keywords: ["merhaba", "selam", "selamlar", "gunaydin", "günaydın", "iyi gunler", "iyi günler", "iyi aksamlar", "iyi akşamlar", "hello", "hi"] },
+  { name: "human", weight: 6, keywords: ["canli destek", "temsilci", "musteri hizmetleri", "insanla konus", "operatore baglan", "canliya aktar"] },
+  { name: "return", weight: 5, keywords: ["iade", "degisim", "değişim", "geri gonder", "geri gönder", "geri yolla", "degistir", "değiştir", "beden kucuk", "beden küçük", "beden buyuk", "beden büyük", "kusurlu", "defolu", "hasarli", "hasarlı"] },
+  { name: "cargo", weight: 4, keywords: ["kargo", "kargo takip", "takip no", "takip numarasi", "kargo nerede", "kargom"] },
+  { name: "order", weight: 4, keywords: ["siparis", "sipariş", "siparisim", "siparişim", "siparis durumu", "sipariş durumu", "nerede", "hazirlaniyor", "hazırlanıyor"] },
+  { name: "support", weight: 3, keywords: ["sikayet", "şikayet", "problem", "sorun", "destek", "yardim edin", "yardım edin"] },
 ];
 
-function detectIntent(normalizedText) {
-  if (!normalizedText) return null;
-  const t = normalizedText;
+function detectIntent(rawNormalized) {
+  if (!rawNormalized) return null;
+
+  const t = expandAbbr(rawNormalized);
+  const c = compact(t);
 
   let best = { name: null, score: 0 };
+
   for (const intent of INTENTS) {
     let s = 0;
     for (const kw of intent.keywords) {
-      const nkw = normalize(kw);
-      if (!nkw) continue;
-      if (t.includes(nkw)) s += intent.score;
+      const k = compact(normalize(kw));
+      if (!k) continue;
+      if (c.includes(k)) s += intent.weight;
     }
     if (s > best.score) best = { name: intent.name, score: s };
   }
 
-  // eşik: 3 altı belirsiz kabul
-  if (best.score < 3) return null;
+  // threshold: 4+ is confident
+  if (best.score < 4) return null;
   return best.name;
 }
 
-// --------- State helpers ----------
-function getSession(from) {
-  return userState.get(from) || { state: "NEW", data: {}, updatedAt: Date.now() };
-}
-function setSession(from, state, dataPatch = {}) {
-  const current = getSession(from);
-  const data = { ...(current.data || {}), ...dataPatch };
-  userState.set(from, { state, data, updatedAt: Date.now() });
-}
-
-// “bulamadım” / “yok” / “bilmiyorum” varyasyonları
-function isCannotFind(textN) {
-  return containsAny(textN, [
-    "bulamadim", "bulamadım", "yok", "bilmiyorum", "hatirlamiyorum", "hatırlamıyorum",
-    "siparis no yok", "siparis numaram yok", "siparis numarasi yok", "bulamiyorum", "bulamıyorum",
-  ]);
-}
-
-// ---------------- Webhook ----------------
+// ---------- Main Handler ----------
 export default async function handler(req, res) {
-  // GET verify
+  // ---- GET verify ----
   if (req.method === "GET") {
     const mode = (req.query["hub.mode"] || "").toString();
     const token = (req.query["hub.verify_token"] || "").toString().trim();
@@ -209,13 +287,12 @@ export default async function handler(req, res) {
     return res.status(200).send(challenge);
   }
 
-  // POST events
+  // ---- POST events ----
   if (req.method === "POST") {
     try {
-      const isWhatsapp = req.body?.object === "whatsapp_business_account";
-      if (!isWhatsapp) return res.status(200).send("EVENT_RECEIVED");
+      if (req.body?.object !== "whatsapp_business_account") return res.status(200).send("EVENT_RECEIVED");
 
-      const inbound = pickInboundText(req.body);
+      const inbound = extractInbound(req.body);
       if (!inbound || !inbound.from) return res.status(200).send("EVENT_RECEIVED");
 
       // dedup
@@ -225,37 +302,136 @@ export default async function handler(req, res) {
       const from = inbound.from;
       const rawText = inbound.text || "";
       const t = normalize(rawText);
-
       const session = getSession(from);
 
-      console.log("FROM:", from, "STATE:", session.state, "TEXT:", t);
+      console.log("FROM:", from, "STATE:", session.state, "TEXT:", t, "PAYLOAD:", inbound.payloadId);
 
-      // HUMAN MODE: bot otomatik cevap vermesin (sadece bilgilendirme)
+      // ---------- HUMAN MODE ----------
+      // Bot susar. Sadece menü komutu ile menü gösterilebilir (istersen kaldır).
       if (session.state === "HUMAN") {
-        // İstersen burada hiçbir şey yazma; ben çok kısa bir cümle bırakıyorum:
-        await sendTextMessage({ to: from, text: "Talebiniz ekipte. Kısa süre içinde yanıt vereceğiz." });
+        const intent = detectIntent(t);
+        if (intent === "menu") {
+          setSession(from, "MAIN_MENU");
+          await showMainMenu(from);
+        }
         return res.status(200).send("EVENT_RECEIVED");
       }
 
-      // Menü komutu her yerden
+      // ---------- Payload Router (Interactive) ----------
+      // Main menu list ids
+      if (inbound.payloadId === "m_order") {
+        setSession(from, "ASK_ORDER_NO", { topic: "order", tries: 0 });
+        await sendText(from, "Sipariş numaranızı yazar mısınız? (Bulamazsanız: bulamadım)");
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+      if (inbound.payloadId === "m_cargo") {
+        setSession(from, "ASK_ORDER_NO", { topic: "cargo", tries: 0 });
+        await sendText(from, "Kargo takibi için sipariş numaranızı yazar mısınız? (Bulamazsanız: bulamadım)");
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+      if (inbound.payloadId === "m_return") {
+        setSession(from, "RETURN_SOURCE");
+        await sendButtons(from, returnFlowIntroText(), [
+          { id: "rs_web", title: "Madmext.com" },
+          { id: "rs_app", title: "Mobil Uygulama" },
+          { id: "rs_mp", title: "Pazaryeri" },
+        ]);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+      if (inbound.payloadId === "m_support") {
+        setSession(from, "ASK_SUPPORT_TEXT");
+        await sendText(from, "Destek talebinizi kısaca yazar mısınız? (Konu + sipariş no varsa ekleyin)");
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      // Return source buttons
+      if (inbound.payloadId === "rs_web" || inbound.payloadId === "rs_app") {
+        setSession(from, "RETURN_TYPE", {
+          source: inbound.payloadId === "rs_web" ? "madmext_web" : "madmext_app",
+        });
+        await sendButtons(from, "İşleminiz hangisi?", [
+          { id: "rt_return", title: "İade" },
+          { id: "rt_exchange", title: "Değişim" },
+          { id: "rt_back", title: "Ana Menü" },
+        ]);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      if (inbound.payloadId === "rs_mp") {
+        setSession(from, "MARKETPLACE_SELECT");
+        await sendList(from, "Hangi pazaryerinden sipariş verdiniz?", "Seçenekleri Gör", [
+          {
+            title: "Pazaryeri",
+            rows: [
+              { id: "mp_trendyol", title: "Trendyol" },
+              { id: "mp_flo", title: "Flo" },
+              { id: "mp_hb", title: "Hepsiburada" },
+              { id: "mp_other", title: "Diğer" },
+            ],
+          },
+        ]);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      // Marketplace list selection
+      if (session.state === "MARKETPLACE_SELECT" && inbound.payloadId) {
+        const platform =
+          inbound.payloadId === "mp_trendyol" ? "Trendyol" :
+          inbound.payloadId === "mp_flo" ? "Flo" :
+          inbound.payloadId === "mp_hb" ? "Hepsiburada" :
+          inbound.payloadId === "mp_other" ? "Diğer" : null;
+
+        if (!platform) {
+          await sendText(from, "Lütfen listeden bir pazaryeri seçin. (Ana menü: menü)");
+          return res.status(200).send("EVENT_RECEIVED");
+        }
+
+        setSession(from, "RETURN_TYPE", { source: "marketplace", platform });
+        await sendButtons(from, `Platform: ${platform}\n\nİşleminiz hangisi?`, [
+          { id: "rt_return", title: "İade" },
+          { id: "rt_exchange", title: "Değişim" },
+          { id: "rt_back", title: "Ana Menü" },
+        ]);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      // Return type buttons
+      if (inbound.payloadId === "rt_back") {
+        setSession(from, "MAIN_MENU");
+        await showMainMenu(from);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      if (inbound.payloadId === "rt_return" || inbound.payloadId === "rt_exchange") {
+        const rt = inbound.payloadId === "rt_return" ? "iade" : "degisim";
+        const cur = getSession(from);
+        setSession(from, "RETURN_ORDER_NO", { ...cur.data, returnType: rt, tries: 0 });
+        await sendText(from, "Sipariş numaranızı yazar mısınız? (Bulamazsanız: bulamadım)");
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      // ---------- Global Intent (text) ----------
+      // menu / live support should work from anywhere (except HUMAN handled above)
       const intent = detectIntent(t);
+
       if (intent === "menu") {
         setSession(from, "MAIN_MENU");
-        await sendTextMessage({ to: from, text: getMainMenu() });
+        await showMainMenu(from);
         return res.status(200).send("EVENT_RECEIVED");
       }
 
-      // İlk temas: selam veya boş/başlangıç -> "size nasıl yardımcı olabilirim?"
-      if (session.state === "NEW") {
-        setSession(from, "MAIN_MENU");
-        await sendTextMessage({ to: from, text: "Merhaba 👋 Size nasıl yardımcı olabilirim?\n\n" + getMainMenu() });
-        return res.status(200).send("EVENT_RECEIVED");
-      }
-
-      // Global “canlı destek” intent
-      if (intent === "human" || containsAny(t, ["canli", "canlı", "temsilci"])) {
-        const ticketNo = genTicketNo("LIVE");
-        tickets.set(ticketNo, { ticketNo, from, reason: rawText, status: "NEW", createdAt: Date.now() });
+      // Live support intent from free text
+      if (intent === "human" || isLiveSupportIntent(t)) {
+        const ticketNo = genTicket("LIVE");
+        const ticket = {
+          ticketNo,
+          from,
+          topic: "live_support",
+          message: rawText,
+          status: "NEW",
+          createdAt: nowTs(),
+        };
+        tickets.set(ticketNo, ticket);
 
         setSession(from, "HUMAN", { ticketNo });
 
@@ -267,122 +443,86 @@ export default async function handler(req, res) {
           at: new Date().toISOString(),
         });
 
-        await sendTextMessage({
-          to: from,
-          text: `Canlı desteğe aktardım ✅\nTalep No: ${ticketNo}\nBirazdan ekibimiz bu sohbet üzerinden yazacak.`,
-        });
-
+        await sendText(from, `Canlı desteğe aktardım ✅\nTalep No: ${ticketNo}\nEkibimiz bu sohbet üzerinden yazacak.`);
         return res.status(200).send("EVENT_RECEIVED");
       }
 
-      // ----- MAIN MENU STATE (1-2-3-4 veya serbest yazı) -----
+      // Greeting: ALWAYS show menu (best UX)
+      if (intent === "greet" || containsAny(t, ["merhaba", "selam", "selamlar", "mrb", "slm", "gunaydin", "günaydın"])) {
+        setSession(from, "MAIN_MENU");
+        await showMainMenu(from);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      // NEW user: welcome + menu
+      if (session.state === "NEW") {
+        setSession(from, "MAIN_MENU");
+        await sendText(from, "Merhaba 👋");
+        await showMainMenu(from);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      // MAIN_MENU: if user writes free text, route by intent
       if (session.state === "MAIN_MENU") {
-        // numerik menü
-        if (t === "1") {
-          setSession(from, "ASK_ORDER_NO", { topic: "order" });
-          await sendTextMessage({ to: from, text: "Sipariş numaranızı yazar mısınız?" });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-        if (t === "2") {
-          setSession(from, "ASK_ORDER_NO", { topic: "cargo" });
-          await sendTextMessage({ to: from, text: "Kargo takibi için sipariş numaranızı yazar mısınız?" });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-        if (t === "3") {
-          setSession(from, "RETURN_SOURCE");
-          await sendTextMessage({
-            to: from,
-            text:
-              "İade / Değişim için siparişinizi nereden oluşturdunuz?\n\n" +
-              "1) Madmext.com\n2) Mobil Uygulama\n3) Pazaryeri\n4) Sipariş numaramı nasıl öğrenirim?",
-          });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-        if (t === "4") {
-          setSession(from, "ASK_COMPLAINT");
-          await sendTextMessage({ to: from, text: "Destek talebinizi kısaca yazar mısınız? (Konu + sipariş no varsa ekleyin)" });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        // serbest yazı -> intent ile akıllı yönlendirme
-        if (intent === "greeting") {
-          await sendTextMessage({ to: from, text: "Merhaba 👋 Size nasıl yardımcı olabilirim?\n\n" + getMainMenu() });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
         if (intent === "return") {
           setSession(from, "RETURN_SOURCE");
-          await sendTextMessage({
-            to: from,
-            text:
-              "İade / Değişim için siparişinizi nereden oluşturdunuz?\n\n" +
-              "1) Madmext.com\n2) Mobil Uygulama\n3) Pazaryeri\n4) Sipariş numaramı nasıl öğrenirim?",
-          });
+          await sendButtons(from, returnFlowIntroText(), [
+            { id: "rs_web", title: "Madmext.com" },
+            { id: "rs_app", title: "Mobil Uygulama" },
+            { id: "rs_mp", title: "Pazaryeri" },
+          ]);
           return res.status(200).send("EVENT_RECEIVED");
         }
 
         if (intent === "cargo") {
-          setSession(from, "ASK_ORDER_NO", { topic: "cargo" });
-          await sendTextMessage({ to: from, text: "Kargo takibi için sipariş numaranızı yazar mısınız?" });
+          setSession(from, "ASK_ORDER_NO", { topic: "cargo", tries: 0 });
+          await sendText(from, "Kargo takibi için sipariş numaranızı yazar mısınız? (Bulamazsanız: bulamadım)");
           return res.status(200).send("EVENT_RECEIVED");
         }
 
         if (intent === "order") {
-          setSession(from, "ASK_ORDER_NO", { topic: "order" });
-          await sendTextMessage({ to: from, text: "Sipariş durumunu kontrol edebilmem için sipariş numaranızı yazar mısınız?" });
+          setSession(from, "ASK_ORDER_NO", { topic: "order", tries: 0 });
+          await sendText(from, "Sipariş durumunu kontrol edebilmem için sipariş numaranızı yazar mısınız? (Bulamazsanız: bulamadım)");
           return res.status(200).send("EVENT_RECEIVED");
         }
 
-        if (intent === "complaint") {
-          setSession(from, "ASK_COMPLAINT");
-          await sendTextMessage({ to: from, text: "Destek konunuzu kısaca yazar mısınız? (Sipariş no varsa ekleyin)" });
+        if (intent === "support") {
+          setSession(from, "ASK_SUPPORT_TEXT");
+          await sendText(from, "Destek talebinizi kısaca yazar mısınız? (Konu + sipariş no varsa ekleyin)");
           return res.status(200).send("EVENT_RECEIVED");
         }
 
-        await sendTextMessage({ to: from, text: "Tam anlayamadım. İsterseniz menüden seçim yapın ya da kısaca yazın.\n\n" + getMainMenu() });
+        // Unknown -> ask user to choose menu
+        await sendText(from, "Tam anlayamadım. Menüyü açıp seçim yapabilir misiniz?");
+        await showMainMenu(from);
         return res.status(200).send("EVENT_RECEIVED");
       }
 
-      // ----- ASK_ORDER_NO -----
+      // ---------- ORDER/CARGO flow ----------
       if (session.state === "ASK_ORDER_NO") {
+        const tries = Number(session.data?.tries || 0);
+
         if (isCannotFind(t)) {
-          // 1) nasıl bulunur anlat
-          setSession(from, "ORDER_NO_HELP", { helpCount: (session.data.helpCount || 0) + 1 });
-          await sendTextMessage({ to: from, text: orderNoHelpText() });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
+          if (tries === 0) {
+            setSession(from, "ASK_ORDER_NO", { ...session.data, tries: 1 });
+            await sendText(from, orderNoHelpText());
+            return res.status(200).send("EVENT_RECEIVED");
+          }
 
-        if (t.length < 3) {
-          await sendTextMessage({ to: from, text: "Sipariş numarası çok kısa görünüyor. Lütfen tekrar yazın. (Bulamıyorsanız: bulamadım)" });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        // demo cevap
-        setSession(from, "MAIN_MENU");
-        await sendTextMessage({
-          to: from,
-          text:
-            `Sipariş numaranız alındı: ${rawText}\n\n` +
-            "Demo bilgi: Siparişiniz hazırlanıyor.\n\n" +
-            "Başka bir konuda yardımcı olmamı ister misiniz?\n\n" +
-            getMainMenu(),
-        });
-        return res.status(200).send("EVENT_RECEIVED");
-      }
-
-      // ----- ORDER_NO_HELP (müşteri hala bulamıyor -> canlı destek) -----
-      if (session.state === "ORDER_NO_HELP") {
-        // müşteri yine bulamadım / yok derse -> HUMAN handoff
-        if (isCannotFind(t) || containsAny(t, ["olmadi", "olmadı", "bulamiyorum", "bulamıyorum", "yok"])) {
-          const ticketNo = genTicketNo("LIVE");
-          tickets.set(ticketNo, {
+          // second failure -> live support handoff
+          const ticketNo = genTicket("LIVE");
+          const topic = session.data?.topic || "order";
+          const ticket = {
             ticketNo,
             from,
+            topic: "live_support",
             reason: "OrderNo not found",
-            lastMessage: rawText,
+            contextTopic: topic,
+            lastUserText: rawText,
             status: "NEW",
-            createdAt: Date.now(),
-          });
+            createdAt: nowTs(),
+          };
+          tickets.set(ticketNo, ticket);
 
           setSession(from, "HUMAN", { ticketNo });
 
@@ -390,181 +530,192 @@ export default async function handler(req, res) {
             type: "HUMAN_REQUEST",
             ticketNo,
             from,
-            message: "Müşteri sipariş numarasını bulamıyor. Canlı destek istiyor.",
+            message: "Müşteri sipariş numarasını bulamıyor (2. deneme).",
+            contextTopic: topic,
             lastUserText: rawText,
             at: new Date().toISOString(),
           });
 
-          await sendTextMessage({
-            to: from,
-            text: `Sipariş numarasını bulamadığınızı anladım.\nCanlı desteğe aktardım ✅\nTalep No: ${ticketNo}\nEkibimiz bu sohbet üzerinden yazacak.`,
-          });
-
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        // müşteri sipariş no gönderdiyse ASK_ORDER_NO'ya geri
-        if (t.length >= 3) {
-          setSession(from, "ASK_ORDER_NO", { topic: session.data.topic || "order" });
-          await sendTextMessage({ to: from, text: "Teşekkürler. Sipariş numaranızı aldım, kontrol ediyorum." });
-          // demo cevap:
-          setSession(from, "MAIN_MENU");
-          await sendTextMessage({ to: from, text: "Demo bilgi: Siparişiniz hazırlanıyor.\n\n" + getMainMenu() });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        await sendTextMessage({ to: from, text: "Sipariş numarasını yazabilir misiniz? Bulamıyorsanız 'bulamadım' yazın, canlı desteğe aktaralım." });
-        return res.status(200).send("EVENT_RECEIVED");
-      }
-
-      // ----- RETURN SOURCE (iade/değişim) -----
-      if (session.state === "RETURN_SOURCE") {
-        if (t === "4" || containsAny(t, ["siparis numarami nasil", "siparis no nasil", "siparis numarasi nasil"])) {
-          setSession(from, "ORDER_NO_HELP", { topic: "return" });
-          await sendTextMessage({ to: from, text: orderNoHelpText() });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        if (t === "1" || t === "2") {
-          setSession(from, "RETURN_TYPE", { source: t === "1" ? "madmext_web" : "madmext_app" });
-          await sendTextMessage({ to: from, text: "İşleminiz hangisi?\n1) İade\n2) Değişim" });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        if (t === "3") {
-          setSession(from, "MARKETPLACE_SELECT");
-          await sendTextMessage({ to: from, text: "Hangi pazaryerinden sipariş verdiniz?\n1) Trendyol\n2) Flo\n3) Hepsiburada\n4) Diğer" });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        await sendTextMessage({ to: from, text: "Lütfen 1-2-3-4 seçeneklerinden birini yazın. (Ana menü: menü)" });
-        return res.status(200).send("EVENT_RECEIVED");
-      }
-
-      if (session.state === "MARKETPLACE_SELECT") {
-        const platform =
-          t === "1" ? "Trendyol" :
-          t === "2" ? "Flo" :
-          t === "3" ? "Hepsiburada" :
-          t === "4" ? "Diger" : null;
-
-        if (!platform) {
-          await sendTextMessage({ to: from, text: "Lütfen 1-2-3-4 seçin." });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        setSession(from, "RETURN_TYPE", { source: "marketplace", platform });
-        await sendTextMessage({ to: from, text: `Tamam. Platform: ${platform}\n\nİşleminiz hangisi?\n1) İade\n2) Değişim` });
-        return res.status(200).send("EVENT_RECEIVED");
-      }
-
-      if (session.state === "RETURN_TYPE") {
-        if (t !== "1" && t !== "2") {
-          await sendTextMessage({ to: from, text: "Lütfen 1) İade veya 2) Değişim yazın." });
-          return res.status(200).send("EVENT_RECEIVED");
-        }
-
-        const type = t === "1" ? "iade" : "degisim";
-        setSession(from, "RETURN_ORDER_NO", { returnType: type });
-
-        await sendTextMessage({ to: from, text: "Sipariş numaranızı yazar mısınız? (Bulamıyorsanız: bulamadım)" });
-        return res.status(200).send("EVENT_RECEIVED");
-      }
-
-      if (session.state === "RETURN_ORDER_NO") {
-        if (isCannotFind(t)) {
-          setSession(from, "ORDER_NO_HELP", { topic: "return" });
-          await sendTextMessage({ to: from, text: orderNoHelpText() });
+          await sendText(from, `Sipariş numarasını bulamadığınızı anladım.\nCanlı desteğe aktardım ✅\nTalep No: ${ticketNo}\nEkibimiz bu sohbet üzerinden yazacak.`);
           return res.status(200).send("EVENT_RECEIVED");
         }
 
         if (t.length < 3) {
-          await sendTextMessage({ to: from, text: "Sipariş numarası çok kısa görünüyor. Lütfen tekrar yazın. (Bulamıyorsanız: bulamadım)" });
+          await sendText(from, "Sipariş numarası çok kısa görünüyor. Lütfen tekrar yazın. (Bulamıyorsanız: bulamadım)");
           return res.status(200).send("EVENT_RECEIVED");
         }
 
-        setSession(from, "RETURN_PRODUCT", { orderNo: rawText });
-        await sendTextMessage({ to: from, text: "Ürün kodu ve beden nedir? (örn: MG2693 / M)" });
+        // Demo response, then back to menu
+        setSession(from, "MAIN_MENU");
+        const topicLabel = session.data?.topic === "cargo" ? "Kargo" : "Sipariş";
+        await sendText(from, `${topicLabel} için sipariş numaranız alındı: ${rawText}\n\nDemo bilgi: İşlem kontrol ediliyor.`);
+        await showMainMenu(from);
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      // ---------- RETURN flow (full ticket) ----------
+      if (session.state === "RETURN_SOURCE") {
+        // if user typed instead of clicking
+        if (intent === "return") {
+          await sendButtons(from, returnFlowIntroText(), [
+            { id: "rs_web", title: "Madmext.com" },
+            { id: "rs_app", title: "Mobil Uygulama" },
+            { id: "rs_mp", title: "Pazaryeri" },
+          ]);
+          return res.status(200).send("EVENT_RECEIVED");
+        }
+
+        await sendText(from, "Lütfen seçeneklerden birini seçin. (Ana menü: menü)");
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      if (session.state === "RETURN_TYPE") {
+        // If user writes "iade"/"degisim" instead of button
+        if (containsAny(t, ["iade", "degisim", "değişim"])) {
+          const rt = t.includes("iade") ? "iade" : "degisim";
+          setSession(from, "RETURN_ORDER_NO", { ...session.data, returnType: rt, tries: 0 });
+          await sendText(from, "Sipariş numaranızı yazar mısınız? (Bulamazsanız: bulamadım)");
+          return res.status(200).send("EVENT_RECEIVED");
+        }
+
+        await sendText(from, "İşlemi seçmek için butonları kullanın. (Ana menü: menü)");
+        return res.status(200).send("EVENT_RECEIVED");
+      }
+
+      if (session.state === "RETURN_ORDER_NO") {
+        const tries = Number(session.data?.tries || 0);
+
+        if (isCannotFind(t)) {
+          if (tries === 0) {
+            setSession(from, "RETURN_ORDER_NO", { ...session.data, tries: 1 });
+            await sendText(from, orderNoHelpText());
+            return res.status(200).send("EVENT_RECEIVED");
+          }
+
+          // second failure -> human
+          const ticketNo = genTicket("LIVE");
+          const ticket = {
+            ticketNo,
+            from,
+            topic: "live_support",
+            reason: "Return flow - OrderNo not found",
+            context: session.data,
+            lastUserText: rawText,
+            status: "NEW",
+            createdAt: nowTs(),
+          };
+          tickets.set(ticketNo, ticket);
+
+          setSession(from, "HUMAN", { ticketNo });
+
+          await notifyOperator({
+            type: "HUMAN_REQUEST",
+            ticketNo,
+            from,
+            message: "İade/Değişim akışında sipariş no bulunamadı (2. deneme).",
+            context: session.data,
+            lastUserText: rawText,
+            at: new Date().toISOString(),
+          });
+
+          await sendText(from, `Sipariş numarasını bulamadığınızı anladım.\nCanlı desteğe aktardım ✅\nTalep No: ${ticketNo}\nEkibimiz bu sohbet üzerinden yazacak.`);
+          return res.status(200).send("EVENT_RECEIVED");
+        }
+
+        if (t.length < 3) {
+          await sendText(from, "Sipariş numarası çok kısa görünüyor. Lütfen tekrar yazın. (Bulamıyorsanız: bulamadım)");
+          return res.status(200).send("EVENT_RECEIVED");
+        }
+
+        setSession(from, "RETURN_PRODUCT", { ...session.data, orderNo: rawText });
+        await sendText(from, "Ürün kodu ve beden nedir? (örn: MG2693 / M)");
         return res.status(200).send("EVENT_RECEIVED");
       }
 
       if (session.state === "RETURN_PRODUCT") {
         if (t.length < 2) {
-          await sendTextMessage({ to: from, text: "Ürün kodu/beden bilgisini tekrar yazar mısınız? (örn: MG2693 / M)" });
+          await sendText(from, "Ürün kodu/beden bilgisini tekrar yazar mısınız? (örn: MG2693 / M)");
           return res.status(200).send("EVENT_RECEIVED");
         }
-        setSession(from, "RETURN_REASON", { productSize: rawText });
-        await sendTextMessage({ to: from, text: "İade/Değişim sebebinizi kısaca yazar mısınız? (örn: beden büyük geldi)" });
+
+        setSession(from, "RETURN_REASON", { ...session.data, productSize: rawText });
+        await sendText(from, "İade/Değişim sebebinizi kısaca yazar mısınız? (örn: beden küçük geldi)");
         return res.status(200).send("EVENT_RECEIVED");
       }
 
       if (session.state === "RETURN_REASON") {
-        const s = getSession(from);
-        const ticketNo = genTicketNo(s.data.source === "marketplace" ? "MP" : "MX");
+        if (t.length < 2) {
+          await sendText(from, "Sebebi kısaca yazar mısınız? (örn: beden büyük geldi / defolu geldi)");
+          return res.status(200).send("EVENT_RECEIVED");
+        }
+
+        const data = session.data || {};
+        const ticketNo = genTicket(data.source === "marketplace" ? "MP" : "MX");
 
         const ticket = {
           ticketNo,
           from,
           topic: "return",
-          source: s.data.source,
-          platform: s.data.platform || null,
-          returnType: s.data.returnType,
-          orderNo: s.data.orderNo,
-          productSize: s.data.productSize,
+          source: data.source,
+          platform: data.platform || null,
+          returnType: data.returnType,
+          orderNo: data.orderNo,
+          productSize: data.productSize,
           reason: rawText,
           status: "NEW",
-          createdAt: Date.now(),
+          createdAt: nowTs(),
         };
         tickets.set(ticketNo, ticket);
 
         setSession(from, "MAIN_MENU");
 
-        await sendTextMessage({
-          to: from,
-          text:
-            `Talebinizi aldık ✅\nTalep No: ${ticketNo}\n\n` +
-            `• İşlem: ${ticket.returnType}\n` +
-            `• Sipariş: ${ticket.orderNo}\n` +
-            `• Ürün/Beden: ${ticket.productSize}\n` +
-            (ticket.platform ? `• Platform: ${ticket.platform}\n` : "") +
-            `• Sebep: ${ticket.reason}\n\n` +
-            "Ekibimiz inceleyip bu sohbet üzerinden dönüş yapacak.\n\n" +
-            getMainMenu(),
-        });
+        await sendText(
+          from,
+          `Talebinizi aldık ✅\nTalep No: ${ticketNo}\n\n` +
+          `• İşlem: ${ticket.returnType}\n` +
+          `• Sipariş: ${ticket.orderNo}\n` +
+          `• Ürün/Beden: ${ticket.productSize}\n` +
+          (ticket.platform ? `• Platform: ${ticket.platform}\n` : "") +
+          `• Sebep: ${ticket.reason}\n\n` +
+          "Ekibimiz inceleyip bu sohbet üzerinden dönüş yapacak."
+        );
 
-        // Operatöre bilgi (isteğe bağlı)
-        await notifyOperator({
-          type: "NEW_TICKET",
-          ticket,
-          at: new Date().toISOString(),
-        });
+        await notifyOperator({ type: "NEW_TICKET", ticket, at: new Date().toISOString() });
 
+        await showMainMenu(from);
         return res.status(200).send("EVENT_RECEIVED");
       }
 
-      // ----- Complaint -----
-      if (session.state === "ASK_COMPLAINT") {
-        const ticketNo = genTicketNo("SUP");
-        const ticket = { ticketNo, from, topic: "support", message: rawText, status: "NEW", createdAt: Date.now() };
+      // ---------- SUPPORT flow ----------
+      if (session.state === "ASK_SUPPORT_TEXT") {
+        const ticketNo = genTicket("SUP");
+        const ticket = {
+          ticketNo,
+          from,
+          topic: "support",
+          message: rawText,
+          status: "NEW",
+          createdAt: nowTs(),
+        };
         tickets.set(ticketNo, ticket);
 
         setSession(from, "MAIN_MENU");
 
-        await sendTextMessage({
-          to: from,
-          text: `Talebinizi aldık ✅\nTalep No: ${ticketNo}\nEkibimiz bu sohbet üzerinden dönüş yapacak.\n\n` + getMainMenu(),
-        });
-
+        await sendText(from, `Talebinizi aldık ✅\nTalep No: ${ticketNo}\nEkibimiz bu sohbet üzerinden dönüş yapacak.`);
         await notifyOperator({ type: "NEW_TICKET", ticket, at: new Date().toISOString() });
+        await showMainMenu(from);
         return res.status(200).send("EVENT_RECEIVED");
       }
 
-      // Fallback
-      await sendTextMessage({ to: from, text: "Tam anlayamadım. 'menü' yazabilir veya kısaca anlatabilirsiniz." });
+      // ---------- Fallback ----------
+      // If we reach here, we don't know how to handle in current state.
+      await sendText(from, "Tam anlayamadım. 'menü' yazabilir veya menüden seçim yapabilirsiniz.");
+      await showMainMenu(from);
       return res.status(200).send("EVENT_RECEIVED");
 
     } catch (e) {
       console.log("WEBHOOK_ERROR:", e?.message || e);
+      // always 200 to prevent retries storm
       return res.status(200).send("EVENT_RECEIVED");
     }
   }
